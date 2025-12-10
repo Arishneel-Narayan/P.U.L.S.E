@@ -8,6 +8,8 @@ import requests
 import io
 import markdown # For HTML report
 import plotly.io as pio
+import time
+import random
 
 # --- 1. Core Data Processing Engine ---
 
@@ -57,19 +59,15 @@ def get_rename_map(wiring_system: str) -> dict:
                     ts_map[hioki_name] = eng_name
             if 'PF' in tech_prefix:
                 ts_map[f"{tech_prefix}{phase_suffix}_Avg"] = f"{phase_prefix}Power Factor"
-            # This loop correctly maps 'PFsum_Avg' to 'Total Power Factor'
-            # We will overwrite this specific mapping below to quarantine the logger's bad value.
 
     ts_map.update({
-        'P_Avg[W]': 'Total Avg Real Power (W)',    # RESTORED - Handles files using P_Avg
-        'S_Avg[VA]': 'Total Avg Apparent Power (VA)',  # RESTORED - Handles files using S_Avg
-        'Q_Avg[var]': 'Total Avg Reactive Power (VAR)',  # RESTORED - Handles files using Q_Avg
+        'P_Avg[W]': 'Total Avg Real Power (W)',    
+        'S_Avg[VA]': 'Total Avg Apparent Power (VA)',  
+        'Q_Avg[var]': 'Total Avg Reactive Power (VAR)',  
         
         # --- QUARANTINE BAD LOGGER DATA ---
-        # Rename the logger's bad PF calculation (from either name) to a new column.
-        # This frees up the 'Total Power Factor' name for our own correct calculation.
-        'PF_Avg': 'Total Power Factor (LOGGER)',  # CHANGED
-        'PFsum_Avg': 'Total Power Factor (LOGGER)', # ADDED
+        'PF_Avg': 'Total Power Factor (LOGGER)',  
+        'PFsum_Avg': 'Total Power Factor (LOGGER)',
         # ---
         
         'P_max[W]': 'Total Max Real Power (W)',
@@ -133,7 +131,6 @@ def load_hioki_data(uploaded_file):
     data_df = data_df.rename(columns=ts_rename_map)
     
     # --- ROBUST DATE PARSING ---
-    # Force YYYY-MM-DD HH:MM:SS format to prevent "Oct 10" being read as "Dec 10"
     try:
         data_df['Datetime'] = pd.to_datetime(data_df['Date'], errors='coerce', format="%Y-%m-%d %H:%M:%S")
     except ValueError:
@@ -145,7 +142,7 @@ def load_hioki_data(uploaded_file):
         
     data_df.dropna(subset=['Datetime'], inplace=True)
 
-    # Filter out unnecessary columns for clean IDs
+    # Filter out unnecessary columns
     identifier_cols_to_check = ['Datetime', 'Date', 'Etime', 'Machine Status']
     existing_identifiers = [col for col in identifier_cols_to_check if col in data_df.columns]
     measurement_cols = data_df.columns.drop(existing_identifiers, errors='ignore')
@@ -163,21 +160,15 @@ def load_hioki_data(uploaded_file):
             data_df[col] = pd.to_numeric(data_df[col], errors='coerce')
 
     # --- ABSOLUTE VALUE FIX ---
-    # Correct for reversed CT clamps (negative PF)
     for col in data_df.columns:
         if 'Power Factor' in col or 'Power' in col:
             data_df[col] = data_df[col].abs()
     
     # --- USER REQUESTED FIX: Recalculate Total PF as Avg of 3 Phases ---
-    # This is more resilient than the Total P / Total S method, which fails if
-    # the total columns aren't found in the CSV.
     if wiring_system == '3P4W':
         phase_pf_cols = ['L1 Power Factor', 'L2 Power Factor', 'L3 Power Factor']
         if all(c in data_df.columns for c in phase_pf_cols):
-            # Calculate row-wise mean of the three phases
-            # .abs() is already applied to these columns in the loop above (L175)
             data_df['Total Power Factor'] = data_df[phase_pf_cols].mean(axis=1)
-    # --- END USER FIX ---
 
     # --- 3P4W CALCULATIONS & TOTALS ---
     if wiring_system == '3P4W':
@@ -189,11 +180,8 @@ def load_hioki_data(uploaded_file):
         if all(c in data_df.columns for c in apparent_cols) and 'Total Avg Apparent Power (VA)' not in data_df.columns:
             data_df['Total Avg Apparent Power (VA)'] = data_df[apparent_cols].sum(axis=1)
 
-    # --- CRITICAL FIX: RECALCULATE TOTAL POWER FACTOR ---
-    # This is the old vector-sum method. We will leave it as a fallback
-    # in case the per-phase PF columns aren't available but the totals are.
+    # --- CRITICAL FIX: RECALCULATE TOTAL POWER FACTOR (Vector Sum) ---
     if 'Total Avg Real Power (W)' in data_df.columns and 'Total Avg Apparent Power (VA)' in data_df.columns:
-        # Check if our user-requested fix already ran. If not, run this one.
         if 'Total Power Factor' not in data_df.columns:
             data_df['Total Power Factor'] = data_df.apply(
                 lambda row: row['Total Avg Real Power (W)'] / row['Total Avg Apparent Power (VA)'] if row['Total Avg Apparent Power (VA)'] > 0 else 0,
@@ -209,7 +197,7 @@ def load_hioki_data(uploaded_file):
 
     return wiring_system, params_df, data_df
 
-# --- 2. AI Service & Summaries ---
+# --- 2. AI Service & Summaries (UPDATED) ---
 
 def generate_transform_summary(file_name: str, data_raw: pd.DataFrame, data_clean: pd.DataFrame) -> str:
     """Generates a log of all data transformations."""
@@ -225,14 +213,10 @@ def generate_transform_summary(file_name: str, data_raw: pd.DataFrame, data_clea
     return "\n".join(summary_lines)
 
 def generate_ai_data_context(data: pd.DataFrame, wiring_system: str) -> str:
-    """
-    Generates a single, comprehensive markdown string containing all peak event
-    and statistical data for the AI, preventing timestamp/value mix-ups.
-    """
+    """Generates a single, comprehensive markdown string containing all peak event and statistical data."""
     if data.empty:
         return "No data available for analysis."
 
-    # --- Define Key Metric Columns ---
     pf_col, power_col, apparent_col = "", "", ""
     phase_cols = {}
     
@@ -241,30 +225,19 @@ def generate_ai_data_context(data: pd.DataFrame, wiring_system: str) -> str:
         power_col = 'Total Avg Real Power (kW)'
         apparent_col = 'Total Avg Apparent Power (kVA)'
         phase_cols = {
-            'L1 Current (A)': 'L1 Avg Current (A)',
-            'L2 Current (A)': 'L2 Avg Current (A)',
-            'L3 Current (A)': 'L3 Avg Current (A)',
-            'L1 Voltage (V)': 'L1 Avg Voltage (V)',
-            'L2 Voltage (V)': 'L2 Avg Voltage (V)',
-            'L3 Voltage (V)': 'L3 Avg Voltage (V)',
-            'L1 Power Factor': 'L1 Power Factor',
-            'L2 Power Factor': 'L2 Power Factor',
-            'L3 Power Factor': 'L3 Power Factor',
+            'L1 Current (A)': 'L1 Avg Current (A)', 'L2 Current (A)': 'L2 Avg Current (A)', 'L3 Current (A)': 'L3 Avg Current (A)',
+            'L1 Voltage (V)': 'L1 Avg Voltage (V)', 'L2 Voltage (V)': 'L2 Avg Voltage (V)', 'L3 Voltage (V)': 'L3 Avg Voltage (V)',
+            'L1 Power Factor': 'L1 Power Factor', 'L2 Power Factor': 'L2 Power Factor', 'L3 Power Factor': 'L3 Power Factor',
         }
     elif wiring_system == '1P2W':
         pf_col = 'Power Factor'
         power_col = 'Avg Real Power (kW)'
         apparent_col = 'Avg Apparent Power (kVA)'
-        phase_cols = {
-            'Current (A)': 'Avg Current (A)',
-            'Voltage (V)': 'Avg Voltage (V)',
-        }
+        phase_cols = {'Current (A)': 'Avg Current (A)', 'Voltage (V)': 'Avg Voltage (V)'}
 
-    # --- 1. Peak Event Summary (Unambiguous) ---
     summary_lines = ["## Peak Event Summary"]
     date_format = '%a %d %b %Y, %H:%M:%S'
 
-    # Find Peak kVA (MD)
     if apparent_col in data.columns and not data[apparent_col].dropna().empty:
         peak_kva_val = data[apparent_col].max()
         peak_kva_time = data.loc[data[apparent_col].idxmax(), 'Datetime'].strftime(date_format)
@@ -272,7 +245,6 @@ def generate_ai_data_context(data: pd.DataFrame, wiring_system: str) -> str:
     else:
         summary_lines.append("- **Peak Demand (MD):** N/A")
 
-    # Find Peak kW (Real Power)
     if power_col in data.columns and not data[power_col].dropna().empty:
         peak_kw_val = data[power_col].max()
         peak_kw_time = data.loc[data[power_col].idxmax(), 'Datetime'].strftime(date_format)
@@ -280,34 +252,25 @@ def generate_ai_data_context(data: pd.DataFrame, wiring_system: str) -> str:
     else:
         summary_lines.append("- **Peak Real Power:** N/A")
 
-    # --- 2. Detailed Statistical Table ---
     summary_lines.append("\n## Detailed Statistical Summary")
-    
     stats_header = "| Metric | Mean | Min | Max | Std Dev (Volatility) |"
     stats_divider = "|:---|---:|---:|---:|---:|"
     stats_rows = [stats_header, stats_divider]
 
-    # Helper to get stats for a column
     def get_stats_row(metric_name: str, col_name: str, data: pd.DataFrame, is_pf: bool = False):
         if col_name in data.columns and not data[col_name].dropna().empty:
             series = data[col_name].dropna()
-            
-            # For PF, filter by operational threshold
             if is_pf and power_col in data.columns and not data[data[power_col] > POWER_THRESHOLD_KW].empty:
                 series = data[data[power_col] > POWER_THRESHOLD_KW][col_name].dropna()
-                if series.empty:
-                    return f"| {metric_name} | N/A (No load) | N/A | N/A | N/A |"
-            
+                if series.empty: return f"| {metric_name} | N/A (No load) | N/A | N/A | N/A |"
             stats = series.describe()
             return f"| {metric_name} | {stats['mean']:.2f} | {stats['min']:.2f} | {stats['max']:.2f} | {stats['std']:.2f} |"
         return f"| {metric_name} | N/A | N/A | N/A | N/A |"
 
-    # Add system-wide stats
     stats_rows.append(get_stats_row("Total Real Power (kW)", power_col, data))
     stats_rows.append(get_stats_row("Total Apparent Power (kVA)", apparent_col, data))
     stats_rows.append(get_stats_row("Total Power Factor", pf_col, data, is_pf=True))
 
-    # Add phase-specific stats
     for metric_name, col_name in phase_cols.items():
         is_pf = 'Power Factor' in metric_name
         stats_rows.append(get_stats_row(metric_name, col_name, data, is_pf=is_pf))
@@ -315,16 +278,14 @@ def generate_ai_data_context(data: pd.DataFrame, wiring_system: str) -> str:
     summary_lines.extend(stats_rows)
     return "\n".join(summary_lines)
 
-
 def get_pulse_analysis(ai_data_context: str,
-                        params_info: str, 
-                        transform_log: str, 
-                        additional_context: str = "") -> str:
-    """Contacts the PULSE AI for an expert analysis."""
+                       params_info: str, 
+                       transform_log: str, 
+                       additional_context: str = "") -> str:
+    """Contacts the PULSE AI with robust retry logic for 503 errors and rate limits."""
     
-    # UPDATED SYSTEM PROMPT
-    system_prompt = """You are PULSE (Power Usage Learning and Support Engine), an expert quantitative analyst for FMF Foods Ltd developed by Arishneel Narayan. Your task is to analyze power data for the process optimization engineer. Introduce yourself with name-purpose and developed by
-
+    system_prompt = """You are PULSE (Power Usage Learning and Support Engine), an expert quantitative analyst for FMF Foods Ltd developed by Arishneel Narayan. Your task is to analyze power data for the process optimization engineer.
+    
     Your analysis MUST be:
     1.  **Numbers-Based:** Be quantitative. Use numbers from the tables provided.
     2.  **Concise:** Use short, simple sentences. Use bullet points and markdown tables.
@@ -348,8 +309,7 @@ def get_pulse_analysis(ai_data_context: str,
     1.  **PULSE Overview** (2-3 key bullet points)
     2.  **Key Points** (Use a markdown table and bullet points based on the 'Detailed Statistical Summary')
     3.  **Recommendations** (Use numbered bullet points, citing standards)
-    
-    Do NOT address the user as "engineer" or "fellow engineer"; just start with the greeting."""
+    """
     
     user_prompt = f"""
     Good morning, Please analyze the following power consumption data for an industrial machine at our Suva facility.
@@ -372,42 +332,60 @@ def get_pulse_analysis(ai_data_context: str,
     except (KeyError, FileNotFoundError):
         return "Error: PULSE API key not found. Please add it to your Streamlit Secrets."
     
-    # Use gemini-2.5-pro and corrected URL spelling
-# Switched to Flash for higher rate limits (15 RPM vs 2 RPM)
+    # --- UPDATED: Use 'gemini-2.5-flash' for higher rate limits ---
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     
     payload = {
         "contents": [{"parts": [{"text": user_prompt}]}],
         "systemInstruction": {"parts": [{"text": system_prompt}]}
     }
-    
-    try:
-        response = requests.post(api_url, json=payload, timeout=120)
-        response.raise_for_status() # Will raise an exception for 4XX/5XX errors
-        
-        result = response.json()
-        
-        if 'error' in result:
-            return f"Error from PULSE API: {result['error']['message']}"
-            
-        candidate = result.get('candidates', [{}])[0]
-        
-        # Check for safety ratings or finish reason
-        if candidate.get('finishReason') not in ['STOP', 'MAX_TOKENS']:
-             return f"Error: PULSE API call finished unexpectedly. Reason: {candidate.get('finishReason', 'Unknown')}"
 
-        if not candidate.get('content', {}).get('parts', []):
-            return "Error: PULSE API returned an empty response. This may be due to safety filters."
+    # --- RETRY LOGIC START ---
+    max_retries = 3
+    base_delay = 2  # Start waiting 2 seconds
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(api_url, json=payload, timeout=30)
             
-        content = candidate['content']['parts'][0]
-        return content.get('text', "Error: Could not extract analysis from the PULSE API response.")
-        
-    except requests.exceptions.HTTPError as http_err:
-        return f"HTTP error occurred: {http_err} - {response.text}"
-    except requests.exceptions.RequestException as req_err:
-        return f"A network error occurred: {req_err}"
-    except Exception as e:
-        return f"An unexpected error occurred while contacting PULSE: {e}"
+            # If successful (200 OK), break the loop and process
+            if response.status_code == 200:
+                result = response.json()
+                
+                if 'error' in result:
+                     return f"Error from PULSE API: {result['error']['message']}"
+
+                candidate = result.get('candidates', [{}])[0]
+                
+                # Check for safety ratings or finish reason
+                if candidate.get('finishReason') not in ['STOP', 'MAX_TOKENS']:
+                     return f"Error: PULSE API call finished unexpectedly. Reason: {candidate.get('finishReason', 'Unknown')}"
+
+                if not candidate.get('content', {}).get('parts', []):
+                    return "Error: PULSE API returned an empty response. This may be due to safety filters."
+                
+                return candidate['content']['parts'][0]['text']
+                
+            # If 503 (Overloaded), wait and retry
+            elif response.status_code == 503:
+                wait_time = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                st.toast(f"⚠️ Server busy. Retrying in {int(wait_time)}s... (Attempt {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+                continue # Go to next loop iteration
+                
+            # If 429 (Quota), stop immediately (retrying won't help)
+            elif response.status_code == 429:
+                return "Error: Daily Quota Exceeded for the AI model. Please try again tomorrow or add a billing account to Google Cloud."
+                
+            else:
+                return f"HTTP Error {response.status_code}: {response.text}"
+
+        except requests.exceptions.RequestException as e:
+            # Handle network errors (timeouts, dns issues)
+            st.error(f"Network error: {e}")
+            return "Analysis failed due to network connection."
+
+    return "Error: Server is currently too overloaded to respond. Please try again in 5 minutes."
 
 # --- 3. Helper Function for Excel Download ---
 
@@ -427,27 +405,24 @@ def generate_html_report(
     kpi_summary_selected: dict,
     kpi_summary_full: dict,
     pulse_analysis: str,
-    data_full: pd.DataFrame # Use full, clean data for graphs
+    data_full: pd.DataFrame 
 ) -> bytes:
     """Generates a self-contained HTML report with embedded graphs."""
     
-    # Helper to create a KPI table
     def kpi_to_html_table(kpi_dict: dict) -> str:
         rows = ""
         for key, value in kpi_dict.items():
-            # Format numbers, leave strings as-is
             val_str = value
             if isinstance(value, (int, float)):
                 if key == "Avg. Total PF":
                     val_str = f"{value:.3f}"
                 elif key == "Max Current Imbalance":
-                     val_str = f"{value:.1f} %"
+                      val_str = f"{value:.1f} %"
                 else:
                     val_str = f"{value:.2f}"
             rows += f"<tr><th>{key}</th><td>{val_str}</td></tr>"
         return f"<table>{rows}</table>"
 
-    # Helper to generate and embed a graph
     def get_graph_html(fig, title: str) -> str:
         if fig is None:
             return f"<h3>{title}</h3><p>Data not available to generate this graph.</p>"
@@ -461,13 +436,13 @@ def generate_html_report(
         plot_cols = [col for col in ['Avg Real Power (kW)', 'Avg Apparent Power (kVA)', 'Avg Reactive Power (kVAR)'] if col in data_full.columns]
         fig_power = None
         if plot_cols:
-            fig_power = px.line(data_full, x='Datetime', y=plot_cols, template="plotly") # Add template
+            fig_power = px.line(data_full, x='Datetime', y=plot_cols, template="plotly")
             fig_power.update_layout(xaxis_title="Date & Time", yaxis_title="Power (kW, kVA, kVAR)", xaxis_tickformat="%a %d %b\n%H:%M")
         graphs_html += get_graph_html(fig_power, "Power Consumption Over Time (Full Period)")
 
         fig_pf = None
         if 'Power Factor' in data_full.columns:
-            fig_pf = px.line(data_full, x='Datetime', y='Power Factor', template="plotly") # Add template
+            fig_pf = px.line(data_full, x='Datetime', y='Power Factor', template="plotly")
             fig_pf.add_hline(y=0.95, line_dash="dash", line_color="red")
             fig_pf.update_layout(xaxis_title="Date & Time", yaxis_title="Power Factor", xaxis_tickformat="%a %d %b\n%H:%M")
         graphs_html += get_graph_html(fig_pf, "Power Factor Over Time (Full Period)")
@@ -476,7 +451,7 @@ def generate_html_report(
         fig_power_total = None
         total_power_cols = [c for c in ['Total Avg Real Power (kW)', 'Total Avg Apparent Power (kVA)', 'Total Avg Reactive Power (kVAR)'] if c in data_full.columns]
         if total_power_cols:
-            fig_power_total = px.line(data_full, x='Datetime', y=total_power_cols, template="plotly") # Add template
+            fig_power_total = px.line(data_full, x='Datetime', y=total_power_cols, template="plotly")
             fig_power_total.update_layout(xaxis_title="Date & Time", yaxis_title="Power (kW, kVA, kVAR)", xaxis_tickformat="%a %d %b\n%H:%M")
         graphs_html += get_graph_html(fig_power_total, "Total System Power (Full Period)")
 
@@ -484,7 +459,7 @@ def generate_html_report(
         current_cols_all = [f'{p} {s} Current (A)' for p in ['L1', 'L2', 'L3'] for s in ['Min', 'Avg', 'Max']]
         plot_cols_current = [c for c in current_cols_all if c in data_full.columns]
         if plot_cols_current:
-            fig_current = px.line(data_full, x='Datetime', y=plot_cols_current, template="plotly") # Add template
+            fig_current = px.line(data_full, x='Datetime', y=plot_cols_current, template="plotly")
             fig_current.update_layout(xaxis_title="Date &Time", yaxis_title="Current (A)", xaxis_tickformat="%a %d %b\n%H:%M")
         graphs_html += get_graph_html(fig_current, "Current Operational Envelope (Full Period)")
 
@@ -492,26 +467,23 @@ def generate_html_report(
         voltage_cols_all = [f'{p} {s} Voltage (V)' for p in ['L1', 'L2', 'L3'] for s in ['Min', 'Avg', 'Max']]
         plot_cols_voltage = [c for c in voltage_cols_all if c in data_full.columns]
         if plot_cols_voltage:
-            fig_voltage = px.line(data_full, x='Datetime', y=plot_cols_voltage, template="plotly") # Add template
+            fig_voltage = px.line(data_full, x='Datetime', y=plot_cols_voltage, template="plotly")
             fig_voltage.update_layout(xaxis_title="Date & Time", yaxis_title="Voltage (V)", xaxis_tickformat="%a %d %b\n%H:%M")
         graphs_html += get_graph_html(fig_voltage, "Voltage Operational Envelope (Full Period)")
             
         fig_pf_phase = None
         pf_cols = [c for c in ['L1 Power Factor', 'L2 Power Factor', 'L3 Power Factor', 'Total Power Factor'] if c in data_full.columns]
         if pf_cols:
-            fig_pf_phase = px.line(data_full, x='Datetime', y=pf_cols, template="plotly") # Add template
+            fig_pf_phase = px.line(data_full, x='Datetime', y=pf_cols, template="plotly")
             fig_pf_phase.update_layout(xaxis_title="Date &Time", yaxis_title="Power Factor", xaxis_tickformat="%a %d %b\n%H:%M")
         graphs_html += get_graph_html(fig_pf_phase, "Power Factor per Phase (Full Period)")
     
-    # --- Convert Markdown to HTML ---
     pulse_analysis_html = markdown.markdown(pulse_analysis, extensions=['tables'])
     
-    # --- Get Other HTML Elements ---
     kpi_selected_html = kpi_to_html_table(kpi_summary_selected)
     kpi_full_html = kpi_to_html_table(kpi_summary_full)
     parameters_html = parameters.to_html()
     
-    # --- Assemble Final HTML ---
     html_template = f"""
     <html>
     <head>
@@ -529,7 +501,6 @@ def generate_html_report(
             .container {{ display: grid; grid-template-columns: 1fr 1fr; gap: 40px; }}
             .full-width {{ grid-column: 1 / -1; }}
             .kpi-section {{ break-inside: avoid; }}
-            /* Styles for AI-generated tables */
             .pulse-analysis table {{ width: 100%; }}
             .pulse-analysis th {{ background-color: #e0ebf5; }}
         </style>
@@ -574,18 +545,15 @@ def generate_html_report(
     
     return html_template.encode('utf-8')
 
-
-# --- 5. KPI Generation Function (Restored) ---
+# --- 5. KPI Generation Function ---
 def generate_kpis(data: pd.DataFrame, wiring_system: str) -> dict:
     """Calculates the main KPI dictionary from a given dataframe."""
     kpi_summary = {}
     if data.empty:
         return {"Error": "No data"}
     
-    # Helper to calculate Average PF safely, using the absolute power threshold
     def calc_avg_pf(df, power_col, pf_col):
         if power_col in df.columns and pf_col in df.columns:
-            # Filter for data rows where power is above the 1.0 kW threshold
             operational_data = df[df[power_col] > POWER_THRESHOLD_KW]
             if not operational_data.empty:
                 operational_pf = operational_data[pf_col].dropna()
@@ -601,18 +569,16 @@ def generate_kpis(data: pd.DataFrame, wiring_system: str) -> dict:
         
         peak_kva = data['Avg Apparent Power (kVA)'].max() if 'Avg Apparent Power (kVA)' in data.columns else 0
         avg_kw = data['Avg Real Power (kW)'].abs().mean() if 'Avg Real Power (kW)' in data.columns else 0
-        
         avg_pf = calc_avg_pf(data, 'Avg Real Power (kW)', 'Power Factor')
         
         kpi_summary = { 
             "Analysis Mode": "Single-Phase", "Total Consumed Energy": f"{total_kwh:.2f} kWh",
             "Peak Demand (MD)": f"{peak_kva:.2f} kVA", "Average Power Draw": f"{avg_kw:.2f} kW",
-            "Avg. Total PF": avg_pf  # <-- Store raw float
+            "Avg. Total PF": avg_pf
         }
         
     elif wiring_system == '3P4W':
         avg_power_kw = data['Total Avg Real Power (kW)'].mean() if 'Total Avg Real Power (kW)' in data.columns else 0
-        
         avg_pf = calc_avg_pf(data, 'Total Avg Real Power (kW)', 'Total Power Factor')
 
         peak_kva_3p = 0
@@ -630,18 +596,16 @@ def generate_kpis(data: pd.DataFrame, wiring_system: str) -> dict:
         kpi_summary = { 
             "Analysis Mode": "Three-Phase", "Avg. Total Power": f"{avg_power_kw:.2f} kW",
             "Peak Demand (MD)": f"{peak_kva_3p:.2f} kVA",
-            "Avg. Total PF": avg_pf,  # <-- Store raw float
+            "Avg. Total PF": avg_pf,
             "Max Current Imbalance": f"{imbalance:.1f} %"
         }
     return kpi_summary
-
 
 # --- 6. Streamlit UI and Analysis Section ---
 st.set_page_config(layout="wide", page_title="FMF PULSE Analysis")
 st.title("⚡ FMF PULSE Analysis Dashboard")
 st.markdown(f"**P**ower **U**sage **L**earning and **S**upport **E**ngine")
 
-# Use requested date format for the title
 current_time_fiji = pd.Timestamp.now(tz='Pacific/Fiji').strftime('%a %d %b %Y')
 st.markdown(f"**Suva, Fiji** | {current_time_fiji}")
 
@@ -657,21 +621,16 @@ else:
         st.session_state.current_file_name = uploaded_file.name
     # --- END FIX ---
     
-    # Use the cached function to load data
     process_result = load_hioki_data(uploaded_file)
 
     if process_result:
         wiring_system, parameters, data_raw = process_result
         
         # --- NEW LOGIC: SEPARATE RAW FROM CLEAN ---
-        
-        # 1. Filter the raw data to create the clean analysis DataFrame
-        data_full = pd.DataFrame() # Initialize
+        data_full = pd.DataFrame() 
         
         if 'Machine Status' in data_raw.columns:
-            # Coerce to numeric, turning 'ERR' codes into NaN. Handles '0', '0.0', '00000000'
             data_raw['Status_Numeric'] = pd.to_numeric(data_raw['Machine Status'], errors='coerce')
-            # Filter for rows where status is exactly 0
             data_full = data_raw[data_raw['Status_Numeric'] == 0].copy()
             
             rows_dropped = len(data_raw) - len(data_full)
@@ -684,22 +643,19 @@ else:
             st.sidebar.warning("Could not find 'Machine Status' column. Analyzing all data.")
             data_full = data_raw.copy()
         
-        # --- END NEW LOGIC ---
-            
         st.sidebar.success(f"File processed successfully!\n\n**Mode: {wiring_system} Analysis**")
         
         if data_full.empty:
             st.error("File was processed, but no valid data was found. Please check the file contents.")
-            st.stop() # Stop execution if no data
+            st.stop()
             
-        data = data_full.copy() # Make a copy for filtering
+        data = data_full.copy()
 
         if not data.empty:
             st.sidebar.markdown("---")
             st.sidebar.subheader("Filter Data by Time")
             min_ts, max_ts = data_full['Datetime'].min(), data_full['Datetime'].max()
             
-            # Use requested date format for the slider
             slider_format = "DD/MM/YY - HH:mm"
             
             start_time, end_time = st.sidebar.slider(
@@ -708,26 +664,21 @@ else:
                 value=(min_ts.to_pydatetime(), max_ts.to_pydatetime()),
                 format=slider_format
             )
-            # Filter the main 'data' DataFrame (which is a copy of data_full)
             data = data_full[(data_full['Datetime'] >= start_time) & (data_full['Datetime'] <= end_time)].copy()
             
             if data.empty:
                 st.warning("No data found in the selected time range. Try expanding the filter.")
-                st.stop() # Stop execution if filter results in no data
+                st.stop()
     
-        # --- KPI Generation ---
         kpi_summary = generate_kpis(data, wiring_system)
         
         if wiring_system == '1P2W':
             st.header("Single-Phase Performance Analysis")
             
-            # --- KPI TYPE ERROR FIX ---
-            # Get values from dict, convert to float for comparison
             total_kwh_str = kpi_summary.get("Total Consumed Energy", "N/A").split(" ")[0]
             peak_kva_str = kpi_summary.get("Peak Demand (MD)", "N/A").split(" ")[0]
             avg_kw_str = kpi_summary.get("Average Power Draw", "N/A").split(" ")[0]
-            avg_pf_val = kpi_summary.get("Avg. Total PF", 0) # Already a float
-            # --- END FIX ---
+            avg_pf_val = kpi_summary.get("Avg. Total PF", 0)
             
             st.subheader("Performance Metrics")
             col1, col2, col3, col4 = st.columns(4)
@@ -736,7 +687,6 @@ else:
             col3.metric("Average Power Draw", f"{float(avg_kw_str):.2f} kW" if avg_kw_str != "N/A" else "N/A")
             col4.metric("Avg. Total PF", f"{avg_pf_val:.3f}" if avg_pf_val > 0 else "N/A")
             
-            # --- RESTORED TABS ---
             tab_names = ["⚡ Power & Energy", "📝 Measurement Settings", "📋 Full Data Table"]
             tabs = st.tabs(tab_names)
             
@@ -745,17 +695,9 @@ else:
                 if plot_cols:
                     st.subheader("Power Consumption Over Time")
                     st.info("This graph shows the Real (useful work), Apparent (total supplied), and Reactive (wasted) power. Look for high Apparent or Reactive power relative to Real power, which indicates electrical inefficiency.")
-                    fig_power = px.line(data, x='Datetime', y=plot_cols, template="plotly") # Add template
-                    
-                    # --- GRAPH FORMATTING ---
-                    fig_power.update_layout(
-                        xaxis_title="Date & Time",
-                        yaxis_title="Power (kW, kVA, kVAR)",
-                        xaxis_tickformat="%a %d %b\n%H:%M" # e.g., "Mon 21 Oct 14:00"
-                    )
+                    fig_power = px.line(data, x='Datetime', y=plot_cols, template="plotly")
+                    fig_power.update_layout(xaxis_title="Date & Time", yaxis_title="Power (kW, kVA, kVAR)", xaxis_tickformat="%a %d %b\n%H:%M")
                     fig_power.update_xaxes(showticklabels=True)
-                    # --- END FORMATTING ---
-                    
                     st.plotly_chart(fig_power, use_container_width=True)
                     with st.expander("Show Key Power Statistics"):
                         stats_data = {
@@ -767,27 +709,18 @@ else:
                 if 'Power Factor' in data.columns:
                     st.subheader("Power Factor Over Time")
                     st.info("Power Factor is an efficiency score (Real Power / Apparent Power). Values below 0.95 (the red line) can lead to utility penalties and indicate wasted energy.")
-                    fig_pf = px.line(data, x='Datetime', y='Power Factor', template="plotly") # Add template
+                    fig_pf = px.line(data, x='Datetime', y='Power Factor', template="plotly")
                     fig_pf.add_hline(y=0.95, line_dash="dash", line_color="red")
-                    
-                    # --- GRAPH FORMATTING ---
-                    fig_pf.update_layout(
-                        xaxis_title="Date & Time",
-                        yaxis_title="Power Factor",
-                        xaxis_tickformat="%a %d %b\n%H:%M"
-                    )
+                    fig_pf.update_layout(xaxis_title="Date & Time", yaxis_title="Power Factor", xaxis_tickformat="%a %d %b\n%H:%M")
                     fig_pf.update_xaxes(showticklabels=True)
-                    # --- END FORMATTING ---
-                    
                     st.plotly_chart(fig_pf, use_container_width=True)
                     with st.expander("Show Power Factor Statistics"):
                         stats_pf = {
                             "Minimum Power Factor": f"{data['Power Factor'].min():.3f}",
-                            "Average Power Factor": f"{avg_pf_val:.3f}" # Use the corrected average
+                            "Average Power Factor": f"{avg_pf_val:.3f}"
                         }
-                        # st.json(stats_pf) # OLD LINE
-                        df_stats = pd.DataFrame(list(stats_pf.items()), columns=['Metric', 'Value']) # NEW
-                        st.dataframe(df_stats, hide_index=True) # NEW
+                        df_stats = pd.DataFrame(list(stats_pf.items()), columns=['Metric', 'Value'])
+                        st.dataframe(df_stats, hide_index=True)
 
             with tabs[1]:
                 st.subheader("Measurement Settings")
@@ -797,8 +730,6 @@ else:
                 st.subheader("Full Raw Data Table (All Status Codes)")
                 st.info("This table shows the complete, unfiltered data, including any rows with error status codes. All graphs and KPIs are calculated *after* filtering out non-zero status rows.")
                 st.dataframe(data_raw)
-                
-                # Download button downloads the CLEAN (Status=0) data_full
                 st.download_button(
                     label="📥 Download Clean Data (Excel)",
                     data=to_excel_bytes(data_full),
@@ -810,40 +741,30 @@ else:
         elif wiring_system == '3P4W':
             st.header("Three-Phase System Diagnostic")
             
-            # --- KPI TYPE ERROR FIX ---
             avg_power_kw_str = kpi_summary.get("Avg. Total Power", "N/A").split(" ")[0]
             peak_kva_3p_str = kpi_summary.get("Peak Demand (MD)", "N/A").split(" ")[0]
-            avg_pf_val = kpi_summary.get("Avg. Total PF", 0) # Already a float
+            avg_pf_val = kpi_summary.get("Avg. Total PF", 0)
             imbalance_str = kpi_summary.get("Max Current Imbalance", "N/A").split(" ")[0]
-            # --- END FIX ---
             
             st.subheader("Performance Metrics")
             col1, col2, col3, col4 = st.columns(4)
-            
             col1.metric("Avg. Total Power", f"{float(avg_power_kw_str):.2f} kW" if avg_power_kw_str != "N/A" else "N/A")
             col2.metric("Peak Demand (MD)", f"{float(peak_kva_3p_str):.2f} kVA" if peak_kva_3p_str != "N/A" else "N/A")
             col3.metric("Avg. Total PF", f"{avg_pf_val:.3f}" if avg_pf_val > 0 else "N/A")
             col4.metric("Max Current Imbalance", f"{float(imbalance_str):.1f} %" if imbalance_str != "N/A" else "N/A", help="Under 5% is good.")
 
-            # --- RESTORED TABS ---
             tab_names_3p = ["📅 Daily Breakdown", "📊 Current & Load Balance", "🩺 Voltage Health", "⚡ Power Analysis", "⚖️ Power Factor", "📝 Settings", "📋 Full Data Table"]
             tabs = st.tabs(tab_names_3p)
             
             with tabs[0]:
                 st.subheader("24-Hour Operational Snapshot")
                 st.info("Select a specific day to generate a detailed 24-hour subplot of all key electrical parameters. This is essential for comparing shift performance or analyzing specific production runs.")
-                # Use data_full for the selector to show all available days
                 unique_days = data_full['Datetime'].dt.date.unique()
-                
-                # Use requested date format
                 day_format_func = lambda d: d.strftime('%a %d %b %Y')
-                
                 selected_day = st.selectbox("Select a day for detailed analysis:", options=unique_days, format_func=day_format_func)
                 
                 if selected_day:
-                    # Filter the *clean* data for the selected day
                     daily_data = data[data['Datetime'].dt.date == selected_day]
-                    
                     if daily_data.empty:
                         st.warning("No data found for the selected day in the current time filter. Try expanding the time filter.")
                     else:
@@ -851,7 +772,7 @@ else:
                             rows=4, cols=1, shared_xaxes=True, 
                             subplot_titles=("Voltage Envelope (V)", "Current Envelope (A)", "Real Power (kW)", "Power Factor")
                         )
-                        fig.update_layout(template="plotly") # Add template
+                        fig.update_layout(template="plotly")
 
                         # Plot Voltage
                         for i in range(1, 4):
@@ -884,11 +805,7 @@ else:
                         fig.update_yaxes(title_text="Power Factor", row=4, col=1)
 
                         fig.update_layout(height=1000, title_text=f"Full Operational Breakdown for {selected_day.strftime('%a %d %b %Y')}", showlegend=True)
-                        fig.update_xaxes(
-                            tickformat="%H:%M", # Show HH:MM for daily breakdown
-                            title_text="Time of Day",
-                            row=4, col=1
-                        )
+                        fig.update_xaxes(tickformat="%H:%M", title_text="Time of Day", row=4, col=1)
                         st.plotly_chart(fig, use_container_width=True)
             
             with tabs[1]:
@@ -897,17 +814,9 @@ else:
                 current_cols_all = [f'{p} {s} Current (A)' for p in ['L1', 'L2', 'L3'] for s in ['Min', 'Avg', 'Max']]
                 plot_cols = [c for c in current_cols_all if c in data.columns]
                 if plot_cols:
-                    fig = px.line(data, x='Datetime', y=plot_cols, template="plotly") # Add template
-                    
-                    # --- GRAPH FORMATTING ---
-                    fig.update_layout(
-                        xaxis_title="Date & Time",
-                        yaxis_title="Current (A)",
-                        xaxis_tickformat="%a %d %b\n%H:%M"
-                    )
+                    fig = px.line(data, x='Datetime', y=plot_cols, template="plotly")
+                    fig.update_layout(xaxis_title="Date & Time", yaxis_title="Current (A)", xaxis_tickformat="%a %d %b\n%H:%M")
                     fig.update_xaxes(showticklabels=True)
-                    # --- END FORMATTING ---
-                    
                     st.plotly_chart(fig, use_container_width=True)
                     with st.expander("Show Current Statistics"):
                         st.dataframe(data[plot_cols].describe().T[['mean', 'min', 'max']].rename(columns={'mean':'Average', 'min':'Minimum', 'max':'Maximum'}))
@@ -918,17 +827,9 @@ else:
                 voltage_cols_all = [f'{p} {s} Voltage (V)' for p in ['L1', 'L2', 'L3'] for s in ['Min', 'Avg', 'Max']]
                 plot_cols = [c for c in voltage_cols_all if c in data.columns]
                 if plot_cols:
-                    fig = px.line(data, x='Datetime', y=plot_cols, template="plotly") # Add template
-                    
-                    # --- GRAPH FORMATTING ---
-                    fig.update_layout(
-                        xaxis_title="Date & Time",
-                        yaxis_title="Voltage (V)",
-                        xaxis_tickformat="%a %d %b\n%H:%M"
-                    )
+                    fig = px.line(data, x='Datetime', y=plot_cols, template="plotly")
+                    fig.update_layout(xaxis_title="Date & Time", yaxis_title="Voltage (V)", xaxis_tickformat="%a %d %b\n%H:%M")
                     fig.update_xaxes(showticklabels=True)
-                    # --- END FORMATTING ---
-                    
                     st.plotly_chart(fig, use_container_width=True)
                     with st.expander("Show Voltage Statistics"):
                         st.dataframe(data[plot_cols].describe().T[['mean', 'min', 'max']].rename(columns={'mean':'Average', 'min':'Minimum', 'max':'Maximum'}))
@@ -938,67 +839,35 @@ else:
                 st.info("These charts show the Real (useful work), Apparent (total), and Reactive (wasted) power. The top chart shows the total system power, while the bottom chart breaks down the real power by phase to identify imbalances in work being done.")
                 total_power_cols = [c for c in ['Total Avg Real Power (kW)', 'Total Avg Apparent Power (kVA)', 'Total Avg Reactive Power (kVAR)'] if c in data.columns]
                 if total_power_cols:
-                    fig = px.line(data, x='Datetime', y=total_power_cols, title="Total System Power", template="plotly") # Add template
-                    
-                    # --- GRAPH FORMATTING ---
-                    fig.update_layout(
-                        xaxis_title="Date & Time",
-                        yaxis_title="Power (kW, kVA, kVAR)",
-                        xaxis_tickformat="%a %d %b\n%H:%M"
-                    )
+                    fig = px.line(data, x='Datetime', y=total_power_cols, title="Total System Power", template="plotly")
+                    fig.update_layout(xaxis_title="Date & Time", yaxis_title="Power (kW, kVA, kVAR)", xaxis_tickformat="%a %d %b\n%H:%M")
                     fig.update_xaxes(showticklabels=True)
-                    # --- END FORMATTING ---
-                    
                     st.plotly_chart(fig, use_container_width=True)
 
                 phase_power_cols = [c for c in ['L1 Avg Real Power (kW)', 'L2 Avg Real Power (kW)', 'L3 Avg Real Power (kW)'] if c in data.columns]
                 if phase_power_cols:
-                    fig2 = px.line(data, x='Datetime', y=phase_power_cols, title="Real Power per Phase", template="plotly") # Add template
-                    
-                    # --- GRAPH FORMATTING ---
-                    fig2.update_layout(
-                        xaxis_title="Date & Time",
-                        yaxis_title="Power (kW)",
-                        xaxis_tickformat="%a %d %b\n%H:%M"
-                    )
+                    fig2 = px.line(data, x='Datetime', y=phase_power_cols, title="Real Power per Phase", template="plotly")
+                    fig2.update_layout(xaxis_title="Date & Time", yaxis_title="Power (kW)", xaxis_tickformat="%a %d %b\n%H:%M")
                     fig2.update_xaxes(showticklabels=True)
-                    # --- END FORMATTING ---
-                    
                     st.plotly_chart(fig2, use_container_width=True)
 
             with tabs[4]:
                 st.subheader("Power Factor per Phase Analysis")
                 st.info("This chart shows the efficiency of each phase. The 'Total Power Factor' (often blue) is recalculated as Total Real Power / Total Apparent Power. If it's lower than the individual phases, it indicates system-wide issues like harmonic distortion.")
                 
-                # --- PLOT FIX: Add Total PF ---
                 pf_cols = [c for c in ['L1 Power Factor', 'L2 Power Factor', 'L3 Power Factor', 'Total Power Factor'] if c in data.columns]
-                # --- END FIX ---
-                
                 if pf_cols:
-                    fig = px.line(data, x='Datetime', y=pf_cols, template="plotly") # Add template
-                    
-                    # --- GRAPH FORMATTING ---
-                    fig.update_layout(
-                        xaxis_title="Date & Time",
-                        yaxis_title="Power Factor",
-                        xaxis_tickformat="%a %d %b\n%H:%M"
-                    )
+                    fig = px.line(data, x='Datetime', y=pf_cols, template="plotly")
+                    fig.update_layout(xaxis_title="Date & Time", yaxis_title="Power Factor", xaxis_tickformat="%a %d %b\n%H:%M")
                     fig.update_xaxes(showticklabels=True)
-                    # --- END FORMATTING ---
-                    
                     st.plotly_chart(fig, use_container_width=True)
                     with st.expander("Show Power Factor Statistics"):
-                        # --- PF STATS FIX ---
                         pf_stats_data = {}
-                        
-                        # Get power threshold
                         power_col = 'Total Avg Real Power (kW)'
                         
                         for col in pf_cols:
                             if col not in data.columns: continue
-                            
                             col_series = pd.Series(dtype=float)
-                            # Use correct power column for filtering
                             if power_col in data.columns:
                                 col_series = data[data[power_col] > POWER_THRESHOLD_KW][col].dropna()
                             
@@ -1011,15 +880,10 @@ else:
                                 }
                             else:
                                 pf_stats_data[col] = {"Average (Operational)": "N/A"}
-                        # st.json(pf_stats_data) # OLD LINE
                         
-                        # NEW LINES START
-                        df_stats = pd.DataFrame(pf_stats_data).T # .T transposes rows/cols
+                        df_stats = pd.DataFrame(pf_stats_data).T 
                         df_stats.index.name = "Metric"
                         st.dataframe(df_stats)
-                        # NEW LINES END
-                        # --- END FIX ---
-
 
             with tabs[5]:
                 st.subheader("Measurement Settings")
@@ -1029,8 +893,6 @@ else:
                 st.subheader("Full Raw Data Table (All Status Codes)")
                 st.info("This table shows the complete, unfiltered data, including any rows with error status codes. All graphs and KPIs are calculated *after* filtering out non-zero status rows.")
                 st.dataframe(data_raw)
-                
-                # Download button downloads the CLEAN (Status=0) data_full
                 st.download_button(
                     label="📥 Download Clean Data (Excel)",
                     data=to_excel_bytes(data_full),
@@ -1049,13 +911,8 @@ else:
                 st.sidebar.error("Cannot run analysis on an empty dataset. Widen your time filter.")
             else:
                 with st.spinner("🧠 PULSE is analyzing the data... This may take a moment."):
-                    # 1. Generate the single, unambiguous data context
                     ai_data_context = generate_ai_data_context(data, wiring_system)
-                    
-                    # 2. Measurement settings
                     params_info_text = parameters.to_string()
-                    
-                    # 3. Transformation Log
                     transform_log_text = generate_transform_summary(uploaded_file.name, data_raw, data_full)
                     
                     pulse_response = get_pulse_analysis(
@@ -1066,25 +923,18 @@ else:
                     )
                     st.session_state['pulse_analysis'] = pulse_response
                     
-                    # --- Save data for HTML report generation ---
                     st.session_state['kpi_summary_selected'] = kpi_summary
-                    # Generate and save full-period KPIs
                     st.session_state['kpi_summary_full'] = generate_kpis(data_full, wiring_system)
                     st.session_state['report_ready'] = True
-                    # --- END ---
-
 
         if 'pulse_analysis' in st.session_state:
             st.markdown("---")
             st.header("🤖 PULSE Analysis")
             st.markdown(st.session_state['pulse_analysis'])
             
-            # --- DOWNLOAD BUTTONS ---
-            st.markdown("---") # Add a separator
-            
+            st.markdown("---")
             dl_col1, dl_col2 = st.columns(2)
             
-            # Button 1: Download AI text
             dl_col1.download_button(
                 label="📄 Download PULSE Report (.txt)",
                 data=st.session_state['pulse_analysis'],
@@ -1093,7 +943,6 @@ else:
                 help="Downloads only the text-based PULSE analysis."
             )
             
-            # Button 2: Download Full HTML Report
             if st.session_state.get('report_ready', False):
                 with st.spinner("Building HTML Report..."):
                     html_bytes = generate_html_report(
@@ -1103,7 +952,7 @@ else:
                         kpi_summary_selected=st.session_state['kpi_summary_selected'],
                         kpi_summary_full=st.session_state['kpi_summary_full'],
                         pulse_analysis=st.session_state['pulse_analysis'],
-                        data_full=data_full # Pass full, clean data for graphs
+                        data_full=data_full
                     )
                 
                 dl_col2.download_button(
@@ -1113,8 +962,6 @@ else:
                     mime="text/html",
                     help="Downloads the complete report with PULSE analysis, KPIs, and all graphs. Open in browser and 'Print to PDF'."
                 )
-            # --- END DOWNLOADS ---
 
     elif uploaded_file is not None:
-        # This triggers if process_result is None
         st.warning("Could not process the uploaded file. Please ensure it is a valid, non-empty Hioki CSV export.")
