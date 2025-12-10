@@ -373,7 +373,8 @@ def get_pulse_analysis(ai_data_context: str,
         return "Error: PULSE API key not found. Please add it to your Streamlit Secrets."
     
     # Use gemini-2.5-pro and corrected URL spelling
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={api_key}"
+# Switched to Flash for higher rate limits (15 RPM vs 2 RPM)
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     
     payload = {
         "contents": [{"parts": [{"text": user_prompt}]}],
