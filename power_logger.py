@@ -197,7 +197,6 @@ def load_hioki_data(uploaded_file):
 
     return wiring_system, params_df, data_df
 
-<<<<<<< HEAD
 RETAIL_MAP = {
     'UA': 'L1 Avg Voltage (V)', 'UB': 'L2 Avg Voltage (V)', 'UC': 'L3 Avg Voltage (V)',
     'IA': 'L1 Avg Current (A)', 'IB': 'L2 Avg Current (A)', 'IC': 'L3 Avg Current (A)',
@@ -232,9 +231,6 @@ def process_retail_csv(content: list):
     return "3P4W", pd.DataFrame(), df # Returns Wiring, Empty Params, Data
 
 # --- 2. AI Service ---
-=======
-# --- 2. AI Service & Summaries (UPDATED) ---
->>>>>>> e0e460be7a19940ab7badfa1464886b00bb5a3e0
 
 def generate_transform_summary(file_name: str, data_raw: pd.DataFrame, data_clean: pd.DataFrame) -> str:
     """Generates a log of all data transformations."""
@@ -652,7 +648,12 @@ uploaded_file = st.sidebar.file_uploader("Upload a raw CSV from your Power Analy
 if uploaded_file is None:
     st.info("Please upload a CSV file to begin analysis.")
 else:
-<<<<<<< HEAD
+    # --- SESSION STATE FIX: Clear state on new file upload ---
+    if 'current_file_name' not in st.session_state or st.session_state.current_file_name != uploaded_file.name:
+        st.session_state.clear()
+        st.session_state.current_file_name = uploaded_file.name
+    # --- END FIX ---
+
     process_result = None
     try:
         content_str = uploaded_file.getvalue().decode('utf-8', errors='replace')
@@ -667,29 +668,17 @@ else:
         if logger_type == "RETAIL":
             process_result = process_retail_csv(lines)
         elif logger_type == "HIOKI":
-            process_result = process_hioki_csv(uploaded_file)
+            process_result = load_hioki_data(uploaded_file)
         else:
             st.error("Unknown logger format. Could not process file.")
 
-    if process_result:
-        wiring_system, parameters, data_full = process_result
-        st.sidebar.success(f"File processed successfully!\n\n**Mode: {wiring_system} Analysis ({logger_type})**")
-=======
-    # --- SESSION STATE FIX: Clear state on new file upload ---
-    if 'current_file_name' not in st.session_state or st.session_state.current_file_name != uploaded_file.name:
-        st.session_state.clear()
-        st.session_state.current_file_name = uploaded_file.name
-    # --- END FIX ---
-    
-    process_result = load_hioki_data(uploaded_file)
-
-    if process_result:
+    if process_result is not None:
         wiring_system, parameters, data_raw = process_result
         
         # --- NEW LOGIC: SEPARATE RAW FROM CLEAN ---
         data_full = pd.DataFrame() 
         
-        if 'Machine Status' in data_raw.columns:
+        if not data_raw.empty and 'Machine Status' in data_raw.columns:
             data_raw['Status_Numeric'] = pd.to_numeric(data_raw['Machine Status'], errors='coerce')
             data_full = data_raw[data_raw['Status_Numeric'] == 0].copy()
             
@@ -700,11 +689,11 @@ else:
                 st.error("No data with Status=0 was found. Cannot perform analysis.")
                 st.stop()
         else:
-            st.sidebar.warning("Could not find 'Machine Status' column. Analyzing all data.")
+            if logger_type == "HIOKI":
+                st.sidebar.warning("Could not find 'Machine Status' column. Analyzing all data.")
             data_full = data_raw.copy()
         
-        st.sidebar.success(f"File processed successfully!\n\n**Mode: {wiring_system} Analysis**")
->>>>>>> e0e460be7a19940ab7badfa1464886b00bb5a3e0
+        st.sidebar.success(f"File processed successfully!\n\n**Mode: {wiring_system} Analysis ({logger_type})**")
         
         if data_full.empty:
             st.error("File was processed, but no valid data was found. Please check the file contents.")
