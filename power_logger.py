@@ -198,11 +198,13 @@ def load_hioki_data(uploaded_file):
     return wiring_system, params_df, data_df
 
 RETAIL_MAP = {
+    'Date': 'Date', 'Time': 'Etime',
     'UA': 'L1 Avg Voltage (V)', 'UB': 'L2 Avg Voltage (V)', 'UC': 'L3 Avg Voltage (V)',
     'IA': 'L1 Avg Current (A)', 'IB': 'L2 Avg Current (A)', 'IC': 'L3 Avg Current (A)',
     'PA': 'L1 Avg Real Power (W)', 'PB': 'L2 Avg Real Power (W)', 'PC': 'L3 Avg Real Power (W)',
     'PSum': 'Total Avg Real Power (W)',
-    'PFA': 'L1 Power Factor', 'PFB': 'L2 Power Factor', 'PFC': 'L3 Power Factor',
+    'SA': 'L1 Avg Apparent Power (VA)', 'SB': 'L2 Avg Apparent Power (VA)', 'SC': 'L3 Avg Apparent Power (VA)',
+    'SSum': 'Total Avg Apparent Power (VA)', # Critical for Peak Demand
     'PFAvg': 'Total Power Factor', 'FAvg': 'Grid Frequency (Hz)'
 }
 
@@ -220,13 +222,16 @@ def process_retail_csv(content: list):
     df.rename(columns=RETAIL_MAP, inplace=True)
     
     # Standardize Time
-    df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], dayfirst=True)
+    if 'Etime' in df.columns:
+        df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Etime'], dayfirst=True)
+    else:
+        df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], dayfirst=True)
     
-    # Standardize Units: Convert Watts to Kilowatts to match UI metrics
+    # Standardize Units: Convert Watts and VA to Kilowatts and kVA to match UI metrics
     for col in list(df.columns):
-        if '(W)' in col:
-            new_name = col.replace('(W)', '(kW)')
-            df[new_name] = df[col] / 1000
+        if '(W)' in col or '(VA)' in col:
+            new_name = col.replace('(W)', '(kW)').replace('(VA)', '(kVA)')
+            df[new_name] = pd.to_numeric(df[col], errors='coerce') / 1000
             
     return "3P4W", pd.DataFrame(), df # Returns Wiring, Empty Params, Data
 
