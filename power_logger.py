@@ -197,7 +197,44 @@ def load_hioki_data(uploaded_file):
 
     return wiring_system, params_df, data_df
 
+<<<<<<< HEAD
+RETAIL_MAP = {
+    'UA': 'L1 Avg Voltage (V)', 'UB': 'L2 Avg Voltage (V)', 'UC': 'L3 Avg Voltage (V)',
+    'IA': 'L1 Avg Current (A)', 'IB': 'L2 Avg Current (A)', 'IC': 'L3 Avg Current (A)',
+    'PA': 'L1 Avg Real Power (W)', 'PB': 'L2 Avg Real Power (W)', 'PC': 'L3 Avg Real Power (W)',
+    'PSum': 'Total Avg Real Power (W)',
+    'PFA': 'L1 Power Factor', 'PFB': 'L2 Power Factor', 'PFC': 'L3 Power Factor',
+    'PFAvg': 'Total Power Factor', 'FAvg': 'Grid Frequency (Hz)'
+}
+
+def detect_logger_type(content: list) -> str:
+    sample = "\n".join(content[:5])
+    if "WIRING" in sample:
+        return "HIOKI"
+    if "ProductSN" in sample:
+        return "RETAIL"
+    return "UNKNOWN"
+
+def process_retail_csv(content: list):
+    # Data starts at index 2 (third row)
+    df = pd.read_csv(io.StringIO("\n".join(content[2:])))
+    df.rename(columns=RETAIL_MAP, inplace=True)
+    
+    # Standardize Time
+    df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], dayfirst=True)
+    
+    # Standardize Units: Convert Watts to Kilowatts to match UI metrics
+    for col in list(df.columns):
+        if '(W)' in col:
+            new_name = col.replace('(W)', '(kW)')
+            df[new_name] = df[col] / 1000
+            
+    return "3P4W", pd.DataFrame(), df # Returns Wiring, Empty Params, Data
+
+# --- 2. AI Service ---
+=======
 # --- 2. AI Service & Summaries (UPDATED) ---
+>>>>>>> e0e460be7a19940ab7badfa1464886b00bb5a3e0
 
 def generate_transform_summary(file_name: str, data_raw: pd.DataFrame, data_clean: pd.DataFrame) -> str:
     """Generates a log of all data transformations."""
@@ -610,11 +647,34 @@ current_time_fiji = pd.Timestamp.now(tz='Pacific/Fiji').strftime('%a %d %b %Y')
 st.markdown(f"**Suva, Fiji** | {current_time_fiji}")
 
 st.sidebar.header("Upload Data")
-uploaded_file = st.sidebar.file_uploader("Upload a raw CSV from your Hioki Power Analyzer", type=["csv"])
+uploaded_file = st.sidebar.file_uploader("Upload a raw CSV from your Power Analyzer (Hioki or Retail)", type=["csv"])
 
 if uploaded_file is None:
     st.info("Please upload a CSV file to begin analysis.")
 else:
+<<<<<<< HEAD
+    process_result = None
+    try:
+        content_str = uploaded_file.getvalue().decode('utf-8', errors='replace')
+        lines = content_str.splitlines()
+    except Exception as e:
+        st.error(f"Error reading or decoding file: {e}")
+        lines = []
+
+    if lines:
+        logger_type = detect_logger_type(lines)
+        
+        if logger_type == "RETAIL":
+            process_result = process_retail_csv(lines)
+        elif logger_type == "HIOKI":
+            process_result = process_hioki_csv(uploaded_file)
+        else:
+            st.error("Unknown logger format. Could not process file.")
+
+    if process_result:
+        wiring_system, parameters, data_full = process_result
+        st.sidebar.success(f"File processed successfully!\n\n**Mode: {wiring_system} Analysis ({logger_type})**")
+=======
     # --- SESSION STATE FIX: Clear state on new file upload ---
     if 'current_file_name' not in st.session_state or st.session_state.current_file_name != uploaded_file.name:
         st.session_state.clear()
@@ -644,6 +704,7 @@ else:
             data_full = data_raw.copy()
         
         st.sidebar.success(f"File processed successfully!\n\n**Mode: {wiring_system} Analysis**")
+>>>>>>> e0e460be7a19940ab7badfa1464886b00bb5a3e0
         
         if data_full.empty:
             st.error("File was processed, but no valid data was found. Please check the file contents.")
