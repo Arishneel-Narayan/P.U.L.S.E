@@ -598,6 +598,13 @@ def generate_kpis(data: pd.DataFrame, wiring_system: str) -> dict:
                 return operational_pf.mean() if not operational_pf.empty else 0
         return 0
 
+    duration_str = "N/A"
+    if len(data) > 1 and 'Datetime' in data.columns:
+        total_seconds = int((data['Datetime'].max() - data['Datetime'].min()).total_seconds())
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        duration_str = f"{hours}h {minutes}m"
+
     if wiring_system == '1P2W':
         total_kwh = 0
         energy_col = 'Consumed Real Energy (Wh)'
@@ -609,9 +616,16 @@ def generate_kpis(data: pd.DataFrame, wiring_system: str) -> dict:
         avg_kw = data['Avg Real Power (kW)'].abs().mean() if 'Avg Real Power (kW)' in data.columns else 0
         avg_pf = calc_avg_pf(data, 'Avg Real Power (kW)', 'Power Factor')
         
+        if total_kwh == 0 and len(data) > 1 and avg_kw > 0:
+            time_diff_hours = (data['Datetime'].max() - data['Datetime'].min()).total_seconds() / 3600
+            total_kwh = avg_kw * time_diff_hours
+            
+        peak_kw_calc = peak_kva * avg_pf if avg_pf > 0 else 0
+        
         kpi_summary = { 
-            "Analysis Mode": "Single-Phase", "Total Consumed Energy": f"{total_kwh:.2f} kWh",
-            "Peak Demand (MD)": f"{peak_kva:.2f} kVA", "Average Power Draw": f"{avg_kw:.2f} kW",
+            "Analysis Mode": "Single-Phase", "Total Energy (kWh)": f"{total_kwh:.2f}",
+            "Measurement Duration": duration_str,
+            "Peak Demand (MD)": f"{peak_kva:.2f} kVA | {peak_kw_calc:.2f} kW", "Average Power Draw": f"{avg_kw:.2f} kW",
             "Avg. Total PF": avg_pf
         }
         
@@ -625,30 +639,127 @@ def generate_kpis(data: pd.DataFrame, wiring_system: str) -> dict:
         elif 'Total Avg Apparent Power (kVA)' in data.columns:
              peak_kva_3p = data['Total Avg Apparent Power (kVA)'].max()
 
+        total_kwh = 0
+        energy_col = 'Total Consumed Real Energy (Wh)'
+        if energy_col in data.columns and not data[energy_col].dropna().empty:
+            energy_vals = data[energy_col].dropna()
+            if len(energy_vals) > 1: total_kwh = (energy_vals.iloc[-1] - energy_vals.iloc[0]) / 1000
+        else:
+            if len(data) > 1 and avg_power_kw > 0:
+                time_diff_hours = (data['Datetime'].max() - data['Datetime'].min()).total_seconds() / 3600
+                total_kwh = avg_power_kw * time_diff_hours
+
         imbalance = 0
         current_cols_avg = ['L1 Avg Current (A)', 'L2 Avg Current (A)', 'L3 Avg Current (A)']
         if all(c in data.columns for c in current_cols_avg):
             avg_currents = data[current_cols_avg].mean()
             if avg_currents.mean() > 0: imbalance = (avg_currents.max() - avg_currents.min()) / avg_currents.mean() * 100
 
+        peak_kw_calc = peak_kva_3p * avg_pf if avg_pf > 0 else 0
+
         kpi_summary = { 
-            "Analysis Mode": "Three-Phase", "Avg. Total Power": f"{avg_power_kw:.2f} kW",
-            "Peak Demand (MD)": f"{peak_kva_3p:.2f} kVA",
+            "Analysis Mode": "Three-Phase", "Total Energy (kWh)": f"{total_kwh:.2f}",
+            "Measurement Duration": duration_str,
+            "Avg. Total Power": f"{avg_power_kw:.2f} kW",
+            "Peak Demand (MD)": f"{peak_kva_3p:.2f} kVA | {peak_kw_calc:.2f} kW",
             "Avg. Total PF": avg_pf,
             "Max Current Imbalance": f"{imbalance:.1f} %"
         }
     return kpi_summary
 
-# --- 6. Streamlit UI and Analysis Section ---
+# --- 6. PocketBase Integration ---
+POCKETBASE_URL = "http://127.0.0.1:8090"
+PB_ADMIN_EMAIL = "aarissagar@gmail.com"
+PB_ADMIN_PASS = "ED7BA470a!"
+PB_COLLECTION = "power_records"
+
+@st.cache_data(ttl=3600)
+def get_pb_token():
+    auth_url = f"{POCKETBASE_URL}/api/collections/_superusers/auth-with-password"
+    try:
+        resp = requests.post(auth_url, json={"identity": PB_ADMIN_EMAIL, "password": PB_ADMIN_PASS}, timeout=5)
+        if resp.status_code == 200:
+            return resp.json().get('token')
+    except Exception:
+        pass
+    return None
+
+def fetch_pb_history():
+    token = get_pb_token()
+    if not token:
+        return []
+    url = f"{POCKETBASE_URL}/api/collections/{PB_COLLECTION}/records?sort=-created"
+    
+    try:
+        resp = requests.get(url, headers={"Authorization": token}, timeout=5)
+        if resp.status_code == 200:
+            return resp.json().get('items', [])
+    except Exception:
+        pass
+    return []
+
+def save_to_pocketbase(file_bytes, file_name, label, wiring):
+    token = get_pb_token()
+    if not token:
+        st.sidebar.error("Could not authenticate with PocketBase.")
+        return False
+        
+    upload_url = f"{POCKETBASE_URL}/api/collections/{PB_COLLECTION}/records"
+    headers = {"Authorization": token}
+    
+    files = {
+        'raw_file': (file_name, file_bytes, 'text/csv'),
+    }
+    data = {
+        'label': label if label else file_name,
+        'wiring': wiring
+    }
+    
+    try:
+        resp = requests.post(upload_url, headers=headers, data=data, files=files, timeout=10)
+        if resp.status_code == 200:
+            return True
+        else:
+            st.sidebar.error(f"Failed to save record: {resp.text}")
+            return False
+    except Exception as e:
+        st.sidebar.error(f"Database connection error: {e}")
+        return False
+
+# --- 7. Streamlit UI and Analysis Section ---
 st.set_page_config(layout="wide", page_title="FMF PULSE Analysis")
-st.title("⚡ FMF PULSE Analysis Dashboard")
+st.title("⚡ P.U.L.S.E Analysis Dashboard")
 st.markdown(f"**P**ower **U**sage **L**earning and **S**upport **E**ngine")
 
 current_time_fiji = pd.Timestamp.now(tz='Pacific/Fiji').strftime('%a %d %b %Y')
 st.markdown(f"**Suva, Fiji** | {current_time_fiji}")
 
 st.sidebar.header("Upload Data")
+db_label = st.sidebar.text_input("File Label (Optional)", placeholder="e.g., Mixer A Morning Shift", help="Custom label for the database history")
 uploaded_file = st.sidebar.file_uploader("Upload a raw CSV from your Power Analyzer (Hioki or Retail)", type=["csv"])
+
+with st.sidebar.expander("📂 View Upload History"):
+    if st.button("Refresh History"):
+        st.session_state['pb_history'] = fetch_pb_history()
+        
+    if 'pb_history' not in st.session_state:
+        st.session_state['pb_history'] = fetch_pb_history()
+        
+    history = st.session_state.get('pb_history', [])
+    if not history:
+        st.write("No upload history found or database not reachable.")
+    else:
+        for record in history:
+            col_label, col_btn = st.columns([0.8, 0.2])
+            with col_label:
+                st.markdown(f"**{record.get('label', 'Unlabeled')}**")
+                st.caption(f"{record.get('wiring', 'Unknown')} | {record.get('created', '')[:16]}")
+            
+            # Direct link to download the file from PocketBase
+            if record.get('raw_file'):
+                file_url = f"{POCKETBASE_URL}/api/files/{PB_COLLECTION}/{record.get('id')}/{record.get('raw_file')}"
+                st.markdown(f"[📥 Download]({file_url})")
+            st.divider()
 
 if uploaded_file is None:
     st.info("Please upload a CSV file to begin analysis.")
@@ -700,6 +811,18 @@ else:
         
         st.sidebar.success(f"File processed successfully!\n\n**Mode: {wiring_system} Analysis ({logger_type})**")
         
+        if st.sidebar.button("💾 Save to Database", use_container_width=True):
+            with st.spinner("Saving to database..."):
+                success = save_to_pocketbase(
+                    uploaded_file.getvalue(), 
+                    uploaded_file.name, 
+                    db_label, 
+                    wiring_system
+                )
+                if success:
+                    st.sidebar.success("Saved successfully!")
+                    st.session_state['pb_history'] = fetch_pb_history() # refresh history
+        
         if data_full.empty:
             st.error("File was processed, but no valid data was found. Please check the file contents.")
             st.stop()
@@ -711,14 +834,33 @@ else:
             st.sidebar.subheader("Filter Data by Time")
             min_ts, max_ts = data_full['Datetime'].min(), data_full['Datetime'].max()
             
-            slider_format = "DD/MM/YY - HH:mm"
-            
-            start_time, end_time = st.sidebar.slider(
-                "Select a time range for analysis:",
-                min_value=min_ts.to_pydatetime(), max_value=max_ts.to_pydatetime(),
-                value=(min_ts.to_pydatetime(), max_ts.to_pydatetime()),
-                format=slider_format
-            )
+            col1, col2 = st.sidebar.columns(2)
+            with col1:
+                start_str = st.text_input("Start (DD/MM/YY HH:MM)", value=min_ts.strftime("%d/%m/%y %H:%M"))
+            with col2:
+                end_str = st.text_input("End (DD/MM/YY HH:MM)", value=max_ts.strftime("%d/%m/%y %H:%M"))
+
+            try:
+                start_entered = pd.to_datetime(start_str, format="%d/%m/%y %H:%M")
+                end_entered = pd.to_datetime(end_str, format="%d/%m/%y %H:%M")
+                
+                # Snap to nearest data points
+                start_idx = (data_full['Datetime'] - start_entered).abs().idxmin()
+                end_idx = (data_full['Datetime'] - end_entered).abs().idxmin()
+                
+                start_time = data_full.loc[start_idx, 'Datetime']
+                end_time = data_full.loc[end_idx, 'Datetime']
+                
+                st.sidebar.caption(f"Snapped to data points: {start_time.strftime('%d/%m/%y %H:%M:%S')} to {end_time.strftime('%d/%m/%y %H:%M:%S')}")
+                
+            except ValueError:
+                st.sidebar.error("Invalid format. Please use DD/MM/YY HH:MM")
+                st.stop()
+                
+            if end_time < start_time:
+                st.sidebar.error("End time cannot be earlier than start time.")
+                st.stop()
+                
             data = data_full[(data_full['Datetime'] >= start_time) & (data_full['Datetime'] <= end_time)].copy()
             
             if data.empty:
@@ -730,17 +872,31 @@ else:
         if wiring_system == '1P2W':
             st.header("Single-Phase Performance Analysis")
             
-            total_kwh_str = kpi_summary.get("Total Consumed Energy", "N/A").split(" ")[0]
-            peak_kva_str = kpi_summary.get("Peak Demand (MD)", "N/A").split(" ")[0]
-            avg_kw_str = kpi_summary.get("Average Power Draw", "N/A").split(" ")[0]
+            total_kwh_str = kpi_summary.get("Total Energy (kWh)", "N/A")
+            duration_str = kpi_summary.get("Measurement Duration", "N/A")
+            peak_md_str = kpi_summary.get("Peak Demand (MD)", "N/A")
             avg_pf_val = kpi_summary.get("Avg. Total PF", 0)
+            avg_kw_str = kpi_summary.get("Average Power Draw", "N/A")
             
             st.subheader("Performance Metrics")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Total Consumed Energy", f"{float(total_kwh_str):.2f} kWh" if total_kwh_str != "N/A" else "N/A")
-            col2.metric("Peak Demand (MD)", f"{float(peak_kva_str):.2f} kVA" if peak_kva_str != "N/A" else "N/A")
-            col3.metric("Average Power Draw", f"{float(avg_kw_str):.2f} kW" if avg_kw_str != "N/A" else "N/A")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Total Energy (kWh)", f"{float(total_kwh_str):.2f} kWh" if total_kwh_str != "N/A" else "N/A")
+            col2.metric("Duration", duration_str)
+            if " | " in peak_md_str:
+                kva_part, kw_part = peak_md_str.split(" | ")
+                col3.metric("Peak Demand (MD)", kva_part, delta=kw_part, delta_color="off")
+            else:
+                col3.metric("Peak Demand (MD)", peak_md_str)
             col4.metric("Avg. Total PF", f"{avg_pf_val:.3f}" if avg_pf_val > 0 else "N/A")
+            col5.metric("Average Power Draw", avg_kw_str)
+            
+            metrics_df = pd.DataFrame(list(kpi_summary.items()), columns=['Metric', 'Value'])
+            st.download_button(
+                label="📥 Download Performance Metrics (CSV)",
+                data=metrics_df.to_csv(index=False),
+                file_name=f"{uploaded_file.name.split('.')[0]}_metrics.csv",
+                mime="text/csv"
+            )
             
             tab_names = ["⚡ Power & Energy", "📝 Measurement Settings", "📋 Full Data Table"]
             tabs = st.tabs(tab_names)
@@ -796,17 +952,32 @@ else:
         elif wiring_system == '3P4W':
             st.header("Three-Phase System Diagnostic")
             
-            avg_power_kw_str = kpi_summary.get("Avg. Total Power", "N/A").split(" ")[0]
-            peak_kva_3p_str = kpi_summary.get("Peak Demand (MD)", "N/A").split(" ")[0]
+            total_kwh_str = kpi_summary.get("Total Energy (kWh)", "N/A")
+            duration_str = kpi_summary.get("Measurement Duration", "N/A")
+            peak_md_str = kpi_summary.get("Peak Demand (MD)", "N/A")
             avg_pf_val = kpi_summary.get("Avg. Total PF", 0)
-            imbalance_str = kpi_summary.get("Max Current Imbalance", "N/A").split(" ")[0]
+            avg_power_kw_str = kpi_summary.get("Avg. Total Power", "N/A")
+            imbalance_str = kpi_summary.get("Max Current Imbalance", "N/A")
             
             st.subheader("Performance Metrics")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Avg. Total Power", f"{float(avg_power_kw_str):.2f} kW" if avg_power_kw_str != "N/A" else "N/A")
-            col2.metric("Peak Demand (MD)", f"{float(peak_kva_3p_str):.2f} kVA" if peak_kva_3p_str != "N/A" else "N/A")
-            col3.metric("Avg. Total PF", f"{avg_pf_val:.3f}" if avg_pf_val > 0 else "N/A")
-            col4.metric("Max Current Imbalance", f"{float(imbalance_str):.1f} %" if imbalance_str != "N/A" else "N/A", help="Under 5% is good.")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Total Energy (kWh)", f"{float(total_kwh_str):.2f} kWh" if total_kwh_str != "N/A" else "N/A")
+            col2.metric("Duration", duration_str)
+            if " | " in peak_md_str:
+                kva_part, kw_part = peak_md_str.split(" | ")
+                col3.metric("Peak Demand (MD)", kva_part, delta=kw_part, delta_color="off")
+            else:
+                col3.metric("Peak Demand (MD)", peak_md_str)
+            col4.metric("Avg. Total PF", f"{avg_pf_val:.3f}" if avg_pf_val > 0 else "N/A")
+            col5.metric("Avg. Total Power", avg_power_kw_str)
+
+            metrics_df = pd.DataFrame(list(kpi_summary.items()), columns=['Metric', 'Value'])
+            st.download_button(
+                label="📥 Download Performance Metrics (CSV)",
+                data=metrics_df.to_csv(index=False),
+                file_name=f"{uploaded_file.name.split('.')[0]}_metrics.csv",
+                mime="text/csv"
+            )
 
             tab_names_3p = ["📅 Daily Breakdown", "📊 Current & Load Balance", "🩺 Voltage Health", "⚡ Power Analysis", "⚖️ Power Factor", "📝 Settings", "📋 Full Data Table"]
             tabs = st.tabs(tab_names_3p)
@@ -874,6 +1045,7 @@ else:
                     fig.update_xaxes(showticklabels=True)
                     st.plotly_chart(fig, use_container_width=True)
                     with st.expander("Show Current Statistics"):
+                        st.metric("Max Current Imbalance", imbalance_str, help="Under 5% is good.")
                         st.dataframe(data[plot_cols].describe().T[['mean', 'min', 'max']].rename(columns={'mean':'Average', 'min':'Minimum', 'max':'Maximum'}))
 
             with tabs[2]:
@@ -1012,11 +1184,12 @@ else:
                 
                 dl_col2.download_button(
                     label="📕 Download Full HTML Report",
-                    data=html_bytes,
+                    data=html_bytes,    
                     file_name=f"{uploaded_file.name.split('.')[0]}_pulse_analysis_report.html",
                     mime="text/html",
                     help="Downloads the complete report with PULSE analysis, KPIs, and all graphs. Open in browser and 'Print to PDF'."
                 )
 
-    elif uploaded_file is not None:
+    elif uploaded_file is not None: 
         st.warning("Could not process the uploaded file. Please ensure it is a valid, non-empty Hioki CSV export.")
+
