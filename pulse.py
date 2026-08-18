@@ -365,11 +365,10 @@ def get_pulse_analysis(ai_data_context: str,
         user_prompt += f"\n**Additional Engineer's Context:**\n{additional_context}"
     user_prompt += "\nBased on all this information, please generate your concise, quantitative, standards-based report."
     
-    try:
-        api_key = st.secrets["GEMINI_API_KEY"]
-    except (KeyError, FileNotFoundError):
-        return "Error: PULSE API key not found. Please add it to your Streamlit Secrets."
-    
+    api_key = st.secrets.get("GEMINI_API_KEY")
+    if not api_key:
+        return "Error: No Gemini API key configured. Add GEMINI_API_KEY to your Streamlit secrets."
+
     # --- UPDATED: Use 'gemini-2.5-flash' for higher rate limits ---
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     
@@ -667,66 +666,7 @@ def generate_kpis(data: pd.DataFrame, wiring_system: str) -> dict:
         }
     return kpi_summary
 
-# --- 6. PocketBase Integration ---
-POCKETBASE_URL = "http://127.0.0.1:8090"
-PB_ADMIN_EMAIL = "aarissagar@gmail.com"
-PB_ADMIN_PASS = "ED7BA470a!"
-PB_COLLECTION = "power_records"
-
-@st.cache_data(ttl=3600)
-def get_pb_token():
-    auth_url = f"{POCKETBASE_URL}/api/collections/_superusers/auth-with-password"
-    try:
-        resp = requests.post(auth_url, json={"identity": PB_ADMIN_EMAIL, "password": PB_ADMIN_PASS}, timeout=5)
-        if resp.status_code == 200:
-            return resp.json().get('token')
-    except Exception:
-        pass
-    return None
-
-def fetch_pb_history():
-    token = get_pb_token()
-    if not token:
-        return []
-    url = f"{POCKETBASE_URL}/api/collections/{PB_COLLECTION}/records?sort=-created"
-    
-    try:
-        resp = requests.get(url, headers={"Authorization": token}, timeout=5)
-        if resp.status_code == 200:
-            return resp.json().get('items', [])
-    except Exception:
-        pass
-    return []
-
-def save_to_pocketbase(file_bytes, file_name, label, wiring):
-    token = get_pb_token()
-    if not token:
-        st.sidebar.error("Could not authenticate with PocketBase.")
-        return False
-        
-    upload_url = f"{POCKETBASE_URL}/api/collections/{PB_COLLECTION}/records"
-    headers = {"Authorization": token}
-    
-    files = {
-        'raw_file': (file_name, file_bytes, 'text/csv'),
-    }
-    data = {
-        'label': label if label else file_name,
-        'wiring': wiring
-    }
-    
-    try:
-        resp = requests.post(upload_url, headers=headers, data=data, files=files, timeout=10)
-        if resp.status_code == 200:
-            return True
-        else:
-            st.sidebar.error(f"Failed to save record: {resp.text}")
-            return False
-    except Exception as e:
-        st.sidebar.error(f"Database connection error: {e}")
-        return False
-
-# --- 7. Streamlit UI and Analysis Section ---
+# --- 6. Streamlit UI and Analysis Section ---
 st.set_page_config(layout="wide", page_title="FMF PULSE Analysis")
 st.title("⚡ P.U.L.S.E Analysis Dashboard")
 st.markdown(f"**P**ower **U**sage **L**earning and **S**upport **E**ngine")
@@ -735,31 +675,7 @@ current_time_fiji = pd.Timestamp.now(tz='Pacific/Fiji').strftime('%a %d %b %Y')
 st.markdown(f"**Suva, Fiji** | {current_time_fiji}")
 
 st.sidebar.header("Upload Data")
-db_label = st.sidebar.text_input("File Label (Optional)", placeholder="e.g., Mixer A Morning Shift", help="Custom label for the database history")
 uploaded_file = st.sidebar.file_uploader("Upload a raw CSV from your Power Analyzer (Hioki or Retail)", type=["csv"])
-
-with st.sidebar.expander("📂 View Upload History"):
-    if st.button("Refresh History"):
-        st.session_state['pb_history'] = fetch_pb_history()
-        
-    if 'pb_history' not in st.session_state:
-        st.session_state['pb_history'] = fetch_pb_history()
-        
-    history = st.session_state.get('pb_history', [])
-    if not history:
-        st.write("No upload history found or database not reachable.")
-    else:
-        for record in history:
-            col_label, col_btn = st.columns([0.8, 0.2])
-            with col_label:
-                st.markdown(f"**{record.get('label', 'Unlabeled')}**")
-                st.caption(f"{record.get('wiring', 'Unknown')} | {record.get('created', '')[:16]}")
-            
-            # Direct link to download the file from PocketBase
-            if record.get('raw_file'):
-                file_url = f"{POCKETBASE_URL}/api/files/{PB_COLLECTION}/{record.get('id')}/{record.get('raw_file')}"
-                st.markdown(f"[📥 Download]({file_url})")
-            st.divider()
 
 if uploaded_file is None:
     st.info("Please upload a CSV file to begin analysis.")
@@ -810,19 +726,7 @@ else:
             data_full = data_raw.copy()
         
         st.sidebar.success(f"File processed successfully!\n\n**Mode: {wiring_system} Analysis ({logger_type})**")
-        
-        if st.sidebar.button("💾 Save to Database", use_container_width=True):
-            with st.spinner("Saving to database..."):
-                success = save_to_pocketbase(
-                    uploaded_file.getvalue(), 
-                    uploaded_file.name, 
-                    db_label, 
-                    wiring_system
-                )
-                if success:
-                    st.sidebar.success("Saved successfully!")
-                    st.session_state['pb_history'] = fetch_pb_history() # refresh history
-        
+
         if data_full.empty:
             st.error("File was processed, but no valid data was found. Please check the file contents.")
             st.stop()
@@ -1184,12 +1088,12 @@ else:
                 
                 dl_col2.download_button(
                     label="📕 Download Full HTML Report",
-                    data=html_bytes,    
+                    data=html_bytes,
                     file_name=f"{uploaded_file.name.split('.')[0]}_pulse_analysis_report.html",
                     mime="text/html",
                     help="Downloads the complete report with PULSE analysis, KPIs, and all graphs. Open in browser and 'Print to PDF'."
                 )
 
-    elif uploaded_file is not None: 
+    elif uploaded_file is not None:
         st.warning("Could not process the uploaded file. Please ensure it is a valid, non-empty Hioki CSV export.")
 
